@@ -22,26 +22,33 @@ import {
   Text,
 } from "@earendil-works/pi-tui";
 import {
+  clearMiniforkBehavior,
   clearReviewerPreference,
+  loadMiniforkBehavior,
   loadReviewerPreference,
   ReviewerPreferenceError,
+  saveMiniforkBehavior,
   saveReviewerPreference,
   type ReviewerRef,
 } from "./minifork-support/reviewer-preference.js";
+import {
+  AgentPresetError,
+  loadAgentPresetCatalog,
+  resolveAgentBehavior,
+  type BehaviorDefinition,
+} from "./agent-presets-support/presets.js";
 
 const DEFAULT_REVIEWER = {
   provider: "openai-codex",
   modelId: "gpt-5.6-sol",
 };
-
+const DEFAULT_MINIFORK_BEHAVIOR = "reviewer";
 const REVIEWER_TOOLS = ["read", "grep", "find", "ls", "review_git"];
-const REVIEWER_SYSTEM_PROMPT = `You are an independent senior code reviewer.
+const MINIFORK_SAFETY_PROMPT = `This is a clean-room mini-fork consultation.
 
-Evaluate only the review packet and the repository state you inspect yourself. You have no access to the main conversation that produced the work, and you must not infer or defer to its reasoning.
+Use only the review packet and the repository state you inspect yourself. You have no access to the main conversation that produced the work, and you must not infer or defer to its reasoning.
 
-Use read, grep, find, and ls to inspect source files. Use review_git for git status, diff, show, log, and changed_files. You cannot edit files or run arbitrary shell commands.
-
-Report concrete findings with severity, exact file paths, and line references where possible. Distinguish verified defects from uncertainty. End with a clear PASS or FAIL verdict.`;
+You may inspect files with the available read-only tools. Do not edit files, write files, run arbitrary shell commands, or make repository changes.`;
 const CHILD_TIMEOUT_MS = 30 * 60 * 1000;
 const MAX_STDERR_CHARS = 20_000;
 const MAX_PROGRESS_ITEMS = 8;
@@ -69,6 +76,7 @@ interface RpcResponse {
 interface ActiveReview {
   child: ChildProcessWithoutNullStreams;
   reviewer: { provider: string; modelId: string };
+  behavior: string;
   reviewRequest: string;
   progress: ProgressReporter;
   userAborted: boolean;
@@ -79,11 +87,24 @@ type ReviewerSelection =
   | { kind: "reset" }
   | { kind: "cancel" };
 
-let disposed = false;
-let mainStreaming = false;
-let activeReview: ActiveReview | null = null;
+type BehaviorSelection =
+  | { kind: "behavior"; name: string }
+  | { kind: "reset" }
+  | { kind: "cancel" };
 
 export default function (pi: ExtensionAPI) {
+  let disposed = false;
+  let mainStreaming = false;
+  let activeReview: ActiveReview | null = null;
+
+  const terminateActiveReview = (reason: string): void => {
+    const review = activeReview;
+    if (!review) return;
+    review.progress.add(`Terminating reviewer (${reason})`);
+    terminateChild(review.child);
+    activeReview = null;
+  };
+
   pi.on("session_shutdown", () => {
     disposed = true;
     terminateActiveReview("session shutdown");
@@ -121,8 +142,13 @@ export default function (pi: ExtensionAPI) {
       let current: ReviewerRef;
       try {
         current = loadReviewerPreference() ?? DEFAULT_REVIEWER;
-      } catch {
-        current = DEFAULT_REVIEWER;
+      } catch (err) {
+        const message =
+          err instanceof ReviewerPreferenceError
+            ? err.message
+            : String(err);
+        ctx.ui.notify(message, "error");
+        return;
       }
 
       const available = ctx.modelRegistry.getAvailable();
@@ -278,6 +304,84 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
+  pi.registerCommand("minifork-behavior", {
+    description: "Choose the behavior for the mini-fork reviewer",
+    handler: async (_args, ctx) => {
+      if (ctx.mode !== "tui") {
+        ctx.ui.notify("/minifork-behavior requires interactive mode", "warning");
+        return;
+      }
+
+      let current = DEFAULT_MINIFORK_BEHAVIOR;
+      try {
+        current = loadMiniforkBehavior() ?? DEFAULT_MINIFORK_BEHAVIOR;
+      } catch (err) {
+        const message =
+          err instanceof ReviewerPreferenceError
+            ? err.message
+            : String(err);
+        ctx.ui.notify(message, "error");
+        return;
+      }
+
+      const catalog = loadAgentPresetCatalog(
+        ctx.cwd,
+        ctx.isProjectTrusted(),
+      );
+      for (const error of catalog.errors) {
+        ctx.ui.notify(`Agent preset config error: ${error}`, "error");
+      }
+
+      const items: SelectItem[] = [
+        {
+          value: "__reset__",
+          label: "Reset to built-in behavior",
+          description: DEFAULT_MINIFORK_BEHAVIOR,
+        },
+      ];
+      const names = [...catalog.behaviors.keys()].sort();
+      for (const name of names) {
+        const behavior = catalog.behaviors.get(name);
+        if (!behavior) continue;
+        items.push({
+          value: name,
+          label: name,
+          description:
+            name === current
+              ? `${behavior.displayName}${behavior.description ? ` · ${behavior.description}` : ""} (current)`
+              : `${behavior.displayName}${behavior.description ? ` · ${behavior.description}` : ""}`,
+        });
+      }
+
+      const selection = await showBehaviorSelector(ctx, items);
+      if (!selection || selection.kind === "cancel") return;
+
+      try {
+        if (selection.kind === "reset") {
+          await clearMiniforkBehavior();
+          ctx.ui.notify(
+            `Mini-fork behavior reset to built-in default (${DEFAULT_MINIFORK_BEHAVIOR})`,
+            "info",
+          );
+          return;
+        }
+
+        resolveAgentBehavior(catalog, selection.name);
+        await saveMiniforkBehavior(selection.name);
+        ctx.ui.notify(
+          `Mini-fork behavior set to ${selection.name}`,
+          "info",
+        );
+      } catch (err) {
+        const message =
+          err instanceof ReviewerPreferenceError || err instanceof AgentPresetError
+            ? err.message
+            : String(err);
+        ctx.ui.notify(`Failed to save behavior: ${message}`, "error");
+      }
+    },
+  });
+
   pi.registerCommand("minifork", {
     description: "Review the latest completed turn in an isolated pi session",
     handler: async (args, ctx) => {
@@ -299,6 +403,21 @@ export default function (pi: ExtensionAPI) {
         ctx.ui.notify(
           "Usage: /minifork [--model provider/model] <review instructions>",
           "warning",
+        );
+        return;
+      }
+
+      let behavior: BehaviorDefinition;
+      try {
+        behavior = getConfiguredBehavior(ctx);
+      } catch (err) {
+        const message =
+          err instanceof ReviewerPreferenceError || err instanceof AgentPresetError
+            ? err.message
+            : String(err);
+        ctx.ui.notify(
+          `${message} Run /minifork-behavior to choose a behavior.`,
+          "error",
         );
         return;
       }
@@ -361,7 +480,10 @@ export default function (pi: ExtensionAPI) {
       }
 
       const prompt = buildReviewPrompt(parsed.reviewRequest, packet);
-      const sessionName = buildSessionName(ctx.sessionManager.getSessionId());
+      const sessionName = buildSessionName(
+        ctx.sessionManager.getSessionId(),
+        behavior.name,
+      );
       const thinkingLevel = reviewerModel.thinkingLevelMap?.max
         ? "max"
         : reviewerModel.reasoning
@@ -376,6 +498,7 @@ export default function (pi: ExtensionAPI) {
         child = spawnReviewer({
           cwd: ctx.cwd,
           reviewer,
+          behavior,
           prompt,
           sessionName,
           thinkingLevel,
@@ -390,6 +513,7 @@ export default function (pi: ExtensionAPI) {
       const review: ActiveReview = {
         child,
         reviewer,
+        behavior: behavior.name,
         reviewRequest: parsed.reviewRequest,
         progress,
         userAborted: false,
@@ -401,7 +525,12 @@ export default function (pi: ExtensionAPI) {
           if (disposed) return;
           if (review.userAborted) return;
 
-          const content = buildReviewMessage(reviewer, parsed.reviewRequest, result);
+          const content = buildReviewMessage(
+            reviewer,
+            review.behavior,
+            parsed.reviewRequest,
+            result,
+          );
           const options = mainStreaming
             ? { deliverAs: "nextTurn" as const, triggerTurn: false }
             : { triggerTurn: false };
@@ -414,6 +543,7 @@ export default function (pi: ExtensionAPI) {
                 display: true,
                 details: {
                   reviewer: `${reviewer.provider}/${reviewer.modelId}`,
+                  behavior: review.behavior,
                   reviewSessionFile: result.sessionFile,
                 },
               },
@@ -446,7 +576,7 @@ export default function (pi: ExtensionAPI) {
         });
 
       ctx.ui.notify(
-        `Mini-fork review started (${reviewer.provider}/${reviewer.modelId}). Main session remains usable.`,
+        `Mini-fork review started (${reviewer.provider}/${reviewer.modelId}, ${behavior.name}). Main session remains usable.`,
         "info",
       );
     },
@@ -476,6 +606,103 @@ function parseModelRef(
     provider: value.slice(0, separator),
     modelId: value.slice(separator + 1),
   };
+}
+
+function getConfiguredBehavior(
+  ctx: ExtensionCommandContext,
+): BehaviorDefinition {
+  const catalog = loadAgentPresetCatalog(
+    ctx.cwd,
+    ctx.isProjectTrusted(),
+  );
+  for (const error of catalog.errors) {
+    ctx.ui.notify(`Agent preset config error: ${error}`, "error");
+  }
+
+  const configured = loadMiniforkBehavior();
+  return resolveAgentBehavior(
+    catalog,
+    configured ?? DEFAULT_MINIFORK_BEHAVIOR,
+  );
+}
+
+async function showBehaviorSelector(
+  ctx: ExtensionCommandContext,
+  items: SelectItem[],
+): Promise<BehaviorSelection | null> {
+  if (items.length === 1) {
+    ctx.ui.notify(
+      `No agent behaviors found. Add a behavior file under ~/.pi/agent/agent-presets/behaviors/`,
+      "warning",
+    );
+    return null;
+  }
+
+  const selection = await ctx.ui.custom<BehaviorSelection>(
+    (tui, theme, _keybindings, done) => {
+      const container = new Container();
+      container.addChild(
+        new DynamicBorder((s: string) => theme.fg("accent", s)),
+      );
+      container.addChild(
+        new Text(theme.fg("accent", theme.bold("Select Mini-fork Behavior")), 1, 0),
+      );
+
+      const selectList = new SelectList(items, Math.min(items.length, 12), {
+        selectedPrefix: (s: string) => theme.fg("accent", s),
+        selectedText: (s: string) => theme.fg("accent", s),
+        description: (s: string) => theme.fg("muted", s),
+        scrollInfo: (s: string) => theme.fg("dim", s),
+        noMatch: (s: string) => theme.fg("warning", s),
+      });
+      selectList.onSelect = (item) => {
+        if (item.value === "__reset__") {
+          done({ kind: "reset" });
+          return;
+        }
+        done({ kind: "behavior", name: item.value });
+      };
+      selectList.onCancel = () => done({ kind: "cancel" });
+      container.addChild(selectList);
+      container.addChild(
+        new Text(
+          theme.fg("dim", "type to filter · ↑↓ navigate · enter select · esc cancel"),
+          1,
+          0,
+        ),
+      );
+      container.addChild(
+        new DynamicBorder((s: string) => theme.fg("accent", s)),
+      );
+
+      let filter = "";
+      return {
+        render: (width: number) => container.render(width),
+        invalidate: () => container.invalidate(),
+        handleInput: (data: string) => {
+          if (
+            data.length === 1 &&
+            data.charCodeAt(0) >= 32 &&
+            data.charCodeAt(0) <= 126
+          ) {
+            filter += data;
+            selectList.setFilter(filter);
+            tui.requestRender();
+            return;
+          }
+          if (matchesKey(data, Key.backspace)) {
+            filter = filter.slice(0, -1);
+            selectList.setFilter(filter);
+            tui.requestRender();
+            return;
+          }
+          selectList.handleInput(data);
+          tui.requestRender();
+        },
+      };
+    },
+  );
+  return selection ?? null;
 }
 
 function extractLatestCompletedTurn(
@@ -559,9 +786,9 @@ function buildReviewPrompt(
   return sections.join("\n");
 }
 
-function buildSessionName(mainSessionId: string): string {
+function buildSessionName(mainSessionId: string, behavior: string): string {
   const stamp = new Date().toISOString().replace(/[:.]/g, "-");
-  return `minifork-${mainSessionId.slice(0, 8)}-${stamp}`;
+  return `minifork-${behavior}-${mainSessionId.slice(0, 8)}-${stamp}`;
 }
 
 function createProgressReporter(
@@ -626,14 +853,33 @@ function getReviewerToolsPath(): string {
   );
 }
 
+function getAgentPresetsExtensionPath(): string {
+  try {
+    const here = path.dirname(fileURLToPath(import.meta.url));
+    const candidate = path.join(here, "agent-presets.ts");
+    if (fs.existsSync(candidate)) return candidate;
+  } catch {
+    // fall through to homedir fallback
+  }
+  return path.join(
+    os.homedir(),
+    ".pi",
+    "agent",
+    "extensions",
+    "agent-presets.ts",
+  );
+}
+
 function spawnReviewer(options: {
   cwd: string;
   reviewer: { provider: string; modelId: string };
+  behavior: BehaviorDefinition;
   prompt: string;
   sessionName: string;
   thinkingLevel: string;
 }): ChildProcessWithoutNullStreams {
   const reviewerToolsPath = getReviewerToolsPath();
+  const agentPresetsPath = getAgentPresetsExtensionPath();
   const args = [
     "--mode",
     "rpc",
@@ -642,6 +888,8 @@ function spawnReviewer(options: {
     "--no-prompt-templates",
     "--no-themes",
     "--no-approve",
+    "-e",
+    agentPresetsPath,
     "-e",
     reviewerToolsPath,
     "--tools",
@@ -653,12 +901,19 @@ function spawnReviewer(options: {
     "--name",
     options.sessionName,
     "--system-prompt",
-    REVIEWER_SYSTEM_PROMPT,
+    MINIFORK_SAFETY_PROMPT,
   ];
   const invocation = getPiInvocation(args);
   return spawn(invocation.command, invocation.args, {
     cwd: options.cwd,
     shell: false,
+    env: {
+      ...process.env,
+      PI_AGENT_PRESET: "",
+      PI_AGENT_BEHAVIOR: options.behavior.name,
+      PI_AGENT_BEHAVIOR_PATH: options.behavior.filePath,
+      PI_MINIFORK: "1",
+    },
     stdio: ["pipe", "pipe", "pipe"],
   });
 }
@@ -873,14 +1128,6 @@ function getPiInvocation(args: string[]): { command: string; args: string[] } {
   return { command: "pi", args };
 }
 
-function terminateActiveReview(reason: string): void {
-  const review = activeReview;
-  if (!review) return;
-  review.progress.add(`Terminating reviewer (${reason})`);
-  terminateChild(review.child);
-  activeReview = null;
-}
-
 function terminateChild(child: ChildProcessWithoutNullStreams | null): void {
   if (!child || child.exitCode !== null || child.signalCode !== null) return;
   child.kill("SIGTERM");
@@ -919,12 +1166,14 @@ function formatToolCall(
 
 function buildReviewMessage(
   reviewer: { provider: string; modelId: string },
+  behavior: string,
   request: string,
   result: ReviewerResult,
 ): string {
   const lines = [
     "## Mini-fork Review",
     `**Reviewer:** ${reviewer.provider}/${reviewer.modelId}`,
+    `**Behavior:** ${behavior}`,
     `**Request:** ${request}`,
   ];
   if (result.sessionFile) {

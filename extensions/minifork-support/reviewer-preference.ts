@@ -7,6 +7,11 @@ export interface ReviewerRef {
   modelId: string;
 }
 
+export interface MiniforkPreference {
+  reviewer?: ReviewerRef;
+  behavior?: string;
+}
+
 export class ReviewerPreferenceError extends Error {
   constructor(message: string) {
     super(message);
@@ -18,7 +23,7 @@ export function getReviewerPreferencePath(): string {
   return path.join(getAgentDir(), "minifork.json");
 }
 
-export function loadReviewerPreference(): ReviewerRef | null {
+export function loadMiniforkPreference(): MiniforkPreference | null {
   const filePath = getReviewerPreferencePath();
   if (!fs.existsSync(filePath)) return null;
 
@@ -36,75 +41,141 @@ export function loadReviewerPreference(): ReviewerRef | null {
     parsed = JSON.parse(raw);
   } catch {
     throw new ReviewerPreferenceError(
-      `${filePath} is not valid JSON. Run /minifork-model to reset.`,
+      `${filePath} is not valid JSON. Run /minifork-model or /minifork-behavior to reset.`,
     );
   }
 
   if (!isRecord(parsed)) {
     throw new ReviewerPreferenceError(
-      `${filePath} has unexpected format. Run /minifork-model to reset.`,
+      `${filePath} has unexpected format. Run /minifork-model or /minifork-behavior to reset.`,
     );
   }
 
   if (parsed.version !== 1) {
     throw new ReviewerPreferenceError(
-      `${filePath} has unsupported version "${String(parsed.version ?? "none")}". Run /minifork-model to reset.`,
+      `${filePath} has unsupported version "${String(parsed.version ?? "none")}". Run /minifork-model or /minifork-behavior to reset.`,
     );
   }
 
-  const reviewer = parsed.reviewer;
-  if (!isRecord(reviewer)) {
+  const preference: MiniforkPreference = {};
+  if (parsed.reviewer !== undefined) {
+    preference.reviewer = parseReviewer(parsed.reviewer, filePath);
+  }
+  if (parsed.behavior !== undefined) {
+    if (
+      typeof parsed.behavior !== "string" ||
+      parsed.behavior.trim().length === 0
+    ) {
+      throw new ReviewerPreferenceError(
+        `${filePath} has empty or invalid behavior. Run /minifork-behavior to reset.`,
+      );
+    }
+    preference.behavior = parsed.behavior.trim();
+  }
+
+  if (!preference.reviewer && !preference.behavior) {
     throw new ReviewerPreferenceError(
-      `${filePath} is missing reviewer field. Run /minifork-model to reset.`,
+      `${filePath} has neither reviewer nor behavior preference. Run /minifork-model or /minifork-behavior to reset.`,
     );
   }
 
-  const provider = reviewer.provider;
-  const modelId = reviewer.modelId;
-  if (typeof provider !== "string" || provider.length === 0) {
-    throw new ReviewerPreferenceError(
-      `${filePath} has empty or missing reviewer.provider. Run /minifork-model to reset.`,
-    );
-  }
-  if (typeof modelId !== "string" || modelId.length === 0) {
-    throw new ReviewerPreferenceError(
-      `${filePath} has empty or missing reviewer.modelId. Run /minifork-model to reset.`,
-    );
-  }
+  return preference;
+}
 
-  return { provider, modelId };
+export function loadReviewerPreference(): ReviewerRef | null {
+  return loadMiniforkPreference()?.reviewer ?? null;
+}
+
+export function loadMiniforkBehavior(): string | null {
+  return loadMiniforkPreference()?.behavior ?? null;
 }
 
 export async function saveReviewerPreference(
   reviewer: ReviewerRef,
 ): Promise<void> {
-  const filePath = getReviewerPreferencePath();
+  const current = loadMiniforkPreference();
+  await writeMiniforkPreference({
+    reviewer,
+    behavior: current?.behavior,
+  });
+}
 
-  const content = JSON.stringify(
+export async function saveMiniforkBehavior(behavior: string): Promise<void> {
+  const normalized = behavior.trim();
+  if (!normalized) {
+    throw new ReviewerPreferenceError("Minifork behavior cannot be empty");
+  }
+  const current = loadMiniforkPreference();
+  await writeMiniforkPreference({
+    reviewer: current?.reviewer,
+    behavior: normalized,
+  });
+}
+
+export async function clearReviewerPreference(): Promise<void> {
+  const current = loadMiniforkPreference();
+  if (!current?.reviewer) return;
+
+  if (current.behavior) {
+    await writeMiniforkPreference({ behavior: current.behavior });
+    return;
+  }
+  await removePreferenceFile();
+}
+
+export async function clearMiniforkBehavior(): Promise<void> {
+  const current = loadMiniforkPreference();
+  if (!current?.behavior) return;
+
+  if (current.reviewer) {
+    await writeMiniforkPreference({ reviewer: current.reviewer });
+    return;
+  }
+  await removePreferenceFile();
+}
+
+async function writeMiniforkPreference(
+  preference: MiniforkPreference,
+): Promise<void> {
+  const filePath = getReviewerPreferencePath();
+  const content = `${JSON.stringify(
     {
       version: 1,
-      reviewer: {
-        provider: reviewer.provider,
-        modelId: reviewer.modelId,
-      },
+      ...(preference.reviewer
+        ? {
+            reviewer: {
+              provider: preference.reviewer.provider,
+              modelId: preference.reviewer.modelId,
+            },
+          }
+        : {}),
+      ...(preference.behavior ? { behavior: preference.behavior } : {}),
     },
     null,
     2,
-  ) + "\n";
+  )}\n`;
 
-  const tmpPath = filePath + ".tmp." + Date.now();
+  const tmpPath = `${filePath}.tmp.${Date.now()}`;
   try {
     await fs.promises.writeFile(tmpPath, content, "utf8");
     await fs.promises.rename(tmpPath, filePath);
   } catch (err) {
-    try { fs.unlinkSync(tmpPath); } catch { /* best-effort cleanup */ }
+    try {
+      await fs.promises.unlink(tmpPath);
+    } catch (cleanupError) {
+      if (!isNodeError(cleanupError) || cleanupError.code !== "ENOENT") {
+        throw new ReviewerPreferenceError(
+          `Failed to save reviewer preference and clean up temporary file: ${cleanupError instanceof Error ? cleanupError.message : String(cleanupError)}`,
+        );
+      }
+    }
     throw new ReviewerPreferenceError(
       `Failed to save reviewer preference: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
 }
 
-export async function clearReviewerPreference(): Promise<void> {
+async function removePreferenceFile(): Promise<void> {
   const filePath = getReviewerPreferencePath();
   try {
     await fs.promises.unlink(filePath);
@@ -114,6 +185,32 @@ export async function clearReviewerPreference(): Promise<void> {
       `Failed to reset reviewer preference: ${err instanceof Error ? err.message : String(err)}`,
     );
   }
+}
+
+function parseReviewer(value: unknown, filePath: string): ReviewerRef {
+  if (!isRecord(value)) {
+    throw new ReviewerPreferenceError(
+      `${filePath} has invalid reviewer field. Run /minifork-model to reset.`,
+    );
+  }
+
+  const provider = value.provider;
+  const modelId = value.modelId;
+  if (typeof provider !== "string" || provider.trim().length === 0) {
+    throw new ReviewerPreferenceError(
+      `${filePath} has empty or missing reviewer.provider. Run /minifork-model to reset.`,
+    );
+  }
+  if (typeof modelId !== "string" || modelId.trim().length === 0) {
+    throw new ReviewerPreferenceError(
+      `${filePath} has empty or missing reviewer.modelId. Run /minifork-model to reset.`,
+    );
+  }
+
+  return {
+    provider: provider.trim(),
+    modelId: modelId.trim(),
+  };
 }
 
 function isRecord(value: unknown): value is Record<string, unknown> {
