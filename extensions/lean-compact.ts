@@ -1,250 +1,265 @@
-/**
- * /abstract — 本地消息瘦身摘要
- *
- * 手动触发的命令，将当前对话历史压缩为 "usr-msg + ai-last-reply" 格式。
- * 不调 LLM，纯本地处理。默认的 /compact 行为不受影响。
- *
- * 策略：通过 session_before_compact hook 拦截，仅在 /abstract 时生效。
- */
+import { contentText, uuidv7, type Usage } from "@earendil-works/pi-ai";
+import type {
+  ExtensionAPI,
+  ExtensionCommandContext,
+  ExtensionContext,
+} from "@earendil-works/pi-coding-agent";
+import {
+  buildDetails,
+  prepareArchive,
+  renderCompactionSummary,
+  validateBoundary,
+  type PreparedArchive,
+} from "./lean-compact-support/core.js";
 
-import type { ExtensionAPI, ExtensionCommandContext } from "@earendil-works/pi-coding-agent";
-import type { SessionEntry, SessionMessageEntry } from "@earendil-works/pi-coding-agent";
+const ABSTRACT_TRIGGER = "__pi_dialogue_abstract_v2__";
+const PROACTIVE_THRESHOLD_TOKENS = 200_000;
+const PROACTIVE_MAX_CONTEXT_WINDOW = 300_000;
+const SEMANTIC_SUMMARY_MAX_TOKENS = 8_192;
 
-const RECENT_TURNS = 3;
-const ABSTRACT_TRIGGER = "__pi_lean_abstract_v1__";
+interface CompactionRequestState {
+  generation: number;
+  sessionKey: string;
+  leafId: string | null;
+  source: "manual" | "proactive";
+}
 
-export default function (pi: ExtensionAPI) {
-  // Hook: 只在 /abstract 触发时接管压缩
+interface SemanticCompressionResult {
+  text: string;
+  usage: Usage;
+}
+
+export default function dialoguePreservingCompaction(pi: ExtensionAPI) {
+  let generation = 0;
+  let sessionKey = "";
+  let compactionRequest: CompactionRequestState | undefined;
+  let hookToken: symbol | undefined;
+  let failedLeafId: string | null | undefined;
+
+  const currentSessionKey = (ctx: ExtensionContext): string =>
+    ctx.sessionManager.getSessionFile() ?? ctx.sessionManager.getSessionId();
+
+  const requestCompaction = (
+    ctx: ExtensionContext,
+    source: CompactionRequestState["source"],
+  ): boolean => {
+    if (compactionRequest || hookToken) {
+      if (source === "manual") {
+        ctx.ui.notify("Dialogue compaction is already running", "warning");
+      }
+      return false;
+    }
+
+    const request: CompactionRequestState = {
+      generation,
+      sessionKey: currentSessionKey(ctx),
+      leafId: ctx.sessionManager.getLeafId(),
+      source,
+    };
+    compactionRequest = request;
+
+    ctx.compact({
+      customInstructions: ABSTRACT_TRIGGER,
+      onComplete: (result) => {
+        if (!isCurrentRequest(request)) return;
+        compactionRequest = undefined;
+        failedLeafId = undefined;
+        const details = result.details as { semanticCompressed?: boolean; archivedTurnCount?: number } | undefined;
+        ctx.ui.notify(
+          `Dialogue compacted: ${result.tokensBefore.toLocaleString()} tokens before, ` +
+            `${details?.archivedTurnCount ?? "?"} archived turn(s), ` +
+            `semantic compression ${details?.semanticCompressed ? "used" : "not needed"}.`,
+          "info",
+        );
+      },
+      onError: (error) => {
+        if (!isCurrentRequest(request)) return;
+        compactionRequest = undefined;
+        failedLeafId = request.leafId;
+        ctx.ui.notify(`Dialogue compaction failed: ${error.message}`, "error");
+      },
+    });
+    return true;
+  };
+
+  const isCurrentRequest = (request: CompactionRequestState): boolean =>
+    generation === request.generation &&
+    sessionKey === request.sessionKey &&
+    compactionRequest === request;
+
+  pi.on("session_start", (_event, ctx) => {
+    generation += 1;
+    sessionKey = currentSessionKey(ctx);
+    compactionRequest = undefined;
+    hookToken = undefined;
+    failedLeafId = undefined;
+  });
+
+  pi.on("session_shutdown", () => {
+    generation += 1;
+    sessionKey = "";
+    compactionRequest = undefined;
+    hookToken = undefined;
+    failedLeafId = undefined;
+  });
+
   pi.on("session_before_compact", async (event, ctx) => {
-    if (event.customInstructions !== ABSTRACT_TRIGGER) return;
-
-    const abstract = prepareAbstract(event.branchEntries);
-    if (!abstract) {
-      ctx.ui.notify("Nothing new to abstract", "info");
+    if (hookToken) {
+      ctx.ui.notify("Duplicate compaction request cancelled", "warning");
+      return { cancel: true };
+    }
+    if (compactionRequest && event.customInstructions !== ABSTRACT_TRIGGER) {
+      ctx.ui.notify("Competing compaction request cancelled", "warning");
       return { cancel: true };
     }
 
-    const summary = buildAbstractSummary(
-      abstract.oldMessages,
-      abstract.previousSummary
-    );
-    if (!summary.trim()) return { cancel: true };
+    const token = Symbol("dialogue-compaction-hook");
+    hookToken = token;
+    const hookGeneration = generation;
+    const hookSessionKey = currentSessionKey(ctx);
+    const preparedLeafId = event.branchEntries.at(-1)?.id ?? null;
 
-    const msgLabel = abstract.previousSummary ? "new messages" : "messages";
-    ctx.ui.notify(
-      `Abstracted ${abstract.oldMessages.length} ${msgLabel} → ${summary.length} chars`,
-      "info"
-    );
+    try {
+      const preparation = event.preparation;
+      if (ctx.sessionManager.getLeafId() !== preparedLeafId) {
+        throw new Error("Active leaf changed before compaction preparation could be consumed");
+      }
+      if (
+        preparation.messagesToSummarize.length === 0 &&
+        preparation.turnPrefixMessages.length === 0
+      ) {
+        throw new Error("Pi preparation contains no messages to compact");
+      }
+      if (preparation.isSplitTurn !== (preparation.turnPrefixMessages.length > 0)) {
+        throw new Error("Pi split-turn preparation is internally inconsistent");
+      }
 
-    return {
-      compaction: {
-        summary,
-        firstKeptEntryId: abstract.firstKeptEntryId,
-        tokensBefore: event.preparation.tokensBefore,
-        details: {
-          abstractVersion: 1,
-          readFiles: [] as string[],
-          modifiedFiles: collectModifiedFiles(abstract.oldMessages),
+      const archive = prepareArchive(
+        event.branchEntries,
+        preparation.firstKeptEntryId,
+        preparation.isSplitTurn,
+      );
+
+      let semanticResult: SemanticCompressionResult | undefined;
+      if (archive.needsSemanticCompression) {
+        semanticResult = await compressOlderDialogue(archive, event.signal, ctx);
+      }
+
+      const currentBranch = ctx.sessionManager.getBranch();
+      if (
+        generation !== hookGeneration ||
+        currentSessionKey(ctx) !== hookSessionKey ||
+        ctx.sessionManager.getLeafId() !== preparedLeafId ||
+        currentBranch.at(-1)?.id !== preparedLeafId ||
+        event.signal.aborted
+      ) {
+        throw new Error("Compaction became stale or was aborted before persistence");
+      }
+      validateBoundary(
+        currentBranch,
+        preparation.firstKeptEntryId,
+        preparation.isSplitTurn,
+      );
+
+      const summary = renderCompactionSummary(archive, semanticResult?.text);
+      if (!summary.trim()) throw new Error("Dialogue compaction produced an empty checkpoint");
+
+      return {
+        compaction: {
+          summary,
+          firstKeptEntryId: preparation.firstKeptEntryId,
+          tokensBefore: preparation.tokensBefore,
+          usage: semanticResult?.usage,
+          details: buildDetails(archive, Boolean(semanticResult)),
         },
-      },
-    };
+      };
+    } catch (error) {
+      const message = error instanceof Error ? error.message : String(error);
+      failedLeafId = ctx.sessionManager.getLeafId();
+      ctx.ui.notify(`Dialogue compaction cancelled: ${message}`, "error");
+      return { cancel: true };
+    } finally {
+      if (hookToken === token) hookToken = undefined;
+    }
   });
 
-  // 注册 /abstract 命令
+  pi.on("agent_settled", (_event, ctx) => {
+    const usage = ctx.getContextUsage();
+    if (
+      !usage ||
+      usage.tokens === null ||
+      !Number.isFinite(usage.tokens) ||
+      usage.contextWindow > PROACTIVE_MAX_CONTEXT_WINDOW ||
+      usage.tokens < PROACTIVE_THRESHOLD_TOKENS ||
+      compactionRequest ||
+      hookToken
+    ) {
+      return;
+    }
+
+    const leafId = ctx.sessionManager.getLeafId();
+    if (failedLeafId === leafId) return;
+    requestCompaction(ctx, "proactive");
+  });
+
   pi.registerCommand("abstract", {
-    description: "瘦身压缩：保留最近3轮，历史精简为 usr-msg + ai-last-reply",
+    description: "Preserve dialogue, remove tool noise, and compact the current session",
     handler: async (_args: string, ctx: ExtensionCommandContext) => {
       if (!ctx.isIdle()) {
-        ctx.ui.notify("Wait for the agent to finish first", "warning");
+        ctx.ui.notify("Wait for the agent to finish before /abstract", "warning");
         return;
       }
-
-      const abstract = prepareAbstract(ctx.sessionManager.getBranch());
-      if (!abstract) {
-        ctx.ui.notify(
-          `Need more than ${RECENT_TURNS} new turns to abstract`,
-          "info"
-        );
-        return;
+      failedLeafId = undefined;
+      if (requestCompaction(ctx, "manual")) {
+        ctx.ui.notify("Building a dialogue-preserving checkpoint...", "info");
       }
-
-      ctx.ui.notify("Abstracting...", "info");
-
-      // 借用 compaction 落盘机制；专属 marker 确保普通 /compact 不被接管
-      ctx.compact({
-        customInstructions: ABSTRACT_TRIGGER,
-        onComplete: (_result) => {
-          ctx.ui.notify("Abstract applied. Use /tree to browse history.", "info");
-        },
-        onError: (err) => {
-          ctx.ui.notify(`Abstract failed: ${err.message}`, "error");
-        },
-      });
     },
   });
 }
 
-// ── 瘦身逻辑 ──
+async function compressOlderDialogue(
+  archive: PreparedArchive,
+  signal: AbortSignal,
+  ctx: ExtensionContext,
+): Promise<SemanticCompressionResult> {
+  const model = ctx.model;
+  if (!model) throw new Error("No model is selected for semantic compression");
 
-interface AbstractPreparation {
-  oldMessages: SessionMessageEntry[];
-  firstKeptEntryId: string;
-  previousSummary?: string;
-}
-
-function prepareAbstract(entries: SessionEntry[]): AbstractPreparation | null {
-  let messageEntries = entries.filter(
-    (e): e is SessionMessageEntry => e.type === "message"
+  const response = await ctx.modelRegistry.complete(
+    model,
+    {
+      systemPrompt:
+        "You compress earlier dialogue for a coding-session checkpoint. Preserve user intent, " +
+        "decisions, constraints, acceptance verdicts, unresolved questions, exact identifiers, and " +
+        "cross-agent handoffs. Do not continue the conversation. Do not invent file changes or outcomes.",
+      messages: [
+        {
+          role: "user",
+          content: [
+            {
+              type: "text",
+              text:
+                "Semantically compress only the earlier dialogue below. The latest three turns are " +
+                "kept verbatim elsewhere. Return concise Markdown reference context, not a response " +
+                `to the speakers.\n\n<earlier-dialogue>\n${archive.olderDialogue}\n</earlier-dialogue>`,
+            },
+          ],
+          timestamp: Date.now(),
+        },
+      ],
+    },
+    {
+      maxTokens: SEMANTIC_SUMMARY_MAX_TOKENS,
+      signal,
+      cacheRetention: "none",
+      sessionId: uuidv7(),
+    },
   );
 
-  const lastCompaction = [...entries]
-    .reverse()
-    .find((e) => e.type === "compaction");
-
-  if (lastCompaction?.type === "compaction") {
-    const startFrom = messageEntries.findIndex(
-      (e) => e.id === lastCompaction.firstKeptEntryId
-    );
-    if (startFrom >= 0) messageEntries = messageEntries.slice(startFrom);
+  if (response.stopReason === "error" || response.stopReason === "aborted") {
+    throw new Error(response.errorMessage || `Semantic compression stopped: ${response.stopReason}`);
   }
-
-  let userCount = 0;
-  let boundaryIndex = -1;
-  for (let i = messageEntries.length - 1; i >= 0; i--) {
-    if (messageEntries[i].message.role !== "user") continue;
-    userCount++;
-    if (userCount === RECENT_TURNS) {
-      boundaryIndex = i;
-      break;
-    }
-  }
-
-  if (boundaryIndex <= 0) return null;
-
-  return {
-    oldMessages: messageEntries.slice(0, boundaryIndex),
-    firstKeptEntryId: messageEntries[boundaryIndex].id,
-    previousSummary:
-      lastCompaction?.type === "compaction"
-        ? lastCompaction.summary
-        : undefined,
-  };
-}
-
-function buildAbstractSummary(
-  entries: SessionMessageEntry[],
-  previousSummary?: string
-): string {
-  const turns = groupIntoTurns(entries);
-  const lines: string[] = [];
-
-  // 最近一次 summary 已经累计包含更早历史，原样保留一次即可
-  if (previousSummary) {
-    lines.push("## Prior Abstract");
-    lines.push(previousSummary);
-    lines.push("");
-  }
-
-  lines.push("## Abstracted History");
-  lines.push("");
-
-  for (let i = 0; i < turns.length; i++) {
-    const turn = turns[i];
-    lines.push(`### Turn ${i + 1}`);
-    lines.push("");
-
-    const userText = extractTextContent(turn.userMessage.message.content);
-    lines.push(`**User:** ${userText}`);
-    lines.push("");
-
-    const slimmed = turn.assistantMessages
-      .map((e) => slimAssistantMessage(e.message))
-      .filter(Boolean);
-
-    if (slimmed.length > 0) {
-      lines.push(`**Assistant:** ${slimmed.join("\n\n")}`);
-    }
-
-    const files = collectModifiedFiles(turn.assistantMessages);
-    if (files.length > 0) {
-      lines.push(`  _Modified:_ ${files.join(", ")}`);
-    }
-
-    lines.push("");
-  }
-
-  return lines.join("\n");
-}
-
-interface Turn {
-  userMessage: SessionMessageEntry;
-  assistantMessages: SessionMessageEntry[];
-}
-
-function groupIntoTurns(entries: SessionMessageEntry[]): Turn[] {
-  const turns: Turn[] = [];
-  let current: Turn | null = null;
-
-  for (const entry of entries) {
-    if (entry.message.role === "user") {
-      if (current) turns.push(current);
-      current = { userMessage: entry, assistantMessages: [] };
-    } else if (current) {
-      current.assistantMessages.push(entry);
-    }
-  }
-  if (current) turns.push(current);
-  return turns;
-}
-
-function extractTextContent(
-  content: string | Array<{ type: string; [key: string]: unknown }>
-): string {
-  if (typeof content === "string") return content.trim();
-  return content
-    .filter((b): b is { type: "text"; text: string } => b.type === "text")
-    .map((b) => b.text)
-    .join("\n")
-    .trim();
-}
-
-function slimAssistantMessage(
-  message: SessionMessageEntry["message"]
-): string | null {
-  if (typeof message.content === "string") return message.content.trim();
-  if (!Array.isArray(message.content)) return null;
-
-  const texts: string[] = [];
-  for (const block of message.content) {
-    if (block.type === "text" && typeof (block as any).text === "string") {
-      const cleaned = stripCodeBlocks((block as any).text);
-      if (cleaned.trim()) texts.push(cleaned.trim());
-    }
-  }
-  return texts.join(" ").trim() || null;
-}
-
-function stripCodeBlocks(text: string): string {
-  let result = text.replace(/```[\s\S]*?```/g, "[code]");
-  result = result.replace(/\n{3,}/g, "\n\n");
-  return result.trim();
-}
-
-function collectModifiedFiles(entries: SessionMessageEntry[]): string[] {
-  const files = new Set<string>();
-  for (const entry of entries) {
-    const content = entry.message.content;
-    if (typeof content === "string" || !Array.isArray(content)) continue;
-    for (const block of content) {
-      if (block.type !== "toolCall") continue;
-      const tc = block as { name: string; arguments: Record<string, unknown> };
-      if (
-        (tc.name === "edit" || tc.name === "write") &&
-        typeof tc.arguments?.path === "string"
-      ) {
-        files.add(tc.arguments.path);
-      }
-    }
-  }
-  return [...files].sort();
+  const text = contentText(response.content).trim();
+  if (!text) throw new Error("Semantic compression returned empty text");
+  return { text, usage: response.usage };
 }
