@@ -1,20 +1,21 @@
 /**
  * Engram Memory Extension — cross-session memory for pi
  *
- * Wraps engram (HTTP API on :7437 + CLI) as pi custom tools:
+ * Wraps engram (HTTP API on :7437) as pi custom tools:
  *   - mem_save   — persist a memory (decision, bugfix, pattern, etc.)
+ *   - mem_edit   — partially update an existing memory by ID
  *   - mem_recall — search memories by keyword
  *   - mem_stats  — show memory store statistics
  *
- * On session_start, injects a summary of recent memories into the system prompt.
+ * No automatic history injection: the model only sees engram content when it
+ * explicitly calls mem_context / mem_recall. The status line on session_start
+ * is purely cosmetic (server reachability + store size).
  */
 
-import { execSync } from "node:child_process";
 import type { ExtensionAPI } from "@earendil-works/pi-coding-agent";
 import { Type } from "typebox";
 
 const ENGRAM_PORT = 7437;
-const ENGRAM_EXE = "engram.exe";
 const ENGRAM_BASE = `http://127.0.0.1:${ENGRAM_PORT}`;
 
 /* --------------- helpers --------------- */
@@ -56,7 +57,40 @@ async function engramSearch(query: string, opts?: {
   if (!res.ok) {
     throw new Error(`engram search failed: ${res.status} ${res.statusText}`);
   }
-  return res.json() as Promise<EngramMemory[]>;
+  // engram's /search returns literal `null` (not []) when a type-filtered
+  // query has no matches — normalize to [] so callers can safely read .length.
+  const data = (await res.json()) as unknown;
+  return Array.isArray(data) ? (data as EngramMemory[]) : [];
+}
+
+async function engramUpdate(id: number, fields: {
+  title?: string;
+  type?: string;
+  content?: string;
+  project?: string;
+  scope?: string;
+  topicKey?: string;
+}): Promise<EngramMemory> {
+  // PATCH /observations/{id} — partial update, only provided fields change.
+  // JSON field names are snake_case (verified against engram store.go).
+  const body: Record<string, string> = {};
+  if (fields.title !== undefined) body.title = fields.title;
+  if (fields.type !== undefined) body.type = fields.type;
+  if (fields.content !== undefined) body.content = fields.content;
+  if (fields.project !== undefined) body.project = fields.project;
+  if (fields.scope !== undefined) body.scope = fields.scope;
+  if (fields.topicKey !== undefined) body.topic_key = fields.topicKey;
+
+  const res = await fetch(`${ENGRAM_BASE}/observations/${id}`, {
+    method: "PATCH",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`engram update failed: ${res.status} ${res.statusText} ${detail}`);
+  }
+  return res.json() as Promise<EngramMemory>;
 }
 
 async function engramStats(): Promise<EngramStats> {
@@ -81,45 +115,42 @@ async function engramContext(project?: string): Promise<string> {
   return data.context;
 }
 
-function engramSave(title: string, content: string, opts?: {
+async function engramSave(title: string, content: string, opts?: {
   type?: string;
   project?: string;
   scope?: string;
   topicKey?: string;
-}): string {
-  const args = ["save", title, content];
-  if (opts?.type) args.push("--type", opts.type);
-  if (opts?.project) args.push("--project", opts.project);
-  if (opts?.scope) args.push("--scope", opts.scope);
-  // topic_key not supported by CLI directly; prepend to content if given
-  let finalContent = content;
-  if (opts?.topicKey) {
-    finalContent = `**Topic**: ${opts.topicKey}\n\n${content}`;
-  }
+}): Promise<{ id: number; status: string }> {
+  // HTTP POST /observations — CLI execSync path drops --type/--project when
+  // content contains newlines (cmd.exe quote parsing), and can't set topic_key.
+  // session_id must be non-empty; "manual-save" matches the CLI's default.
+  const body: Record<string, string> = {
+    session_id: "manual-save",
+    title,
+    content,
+  };
+  if (opts?.type) body.type = opts.type;
+  if (opts?.project) body.project = opts.project;
+  if (opts?.scope) body.scope = opts.scope;
+  if (opts?.topicKey) body.topic_key = opts.topicKey;
 
-  // Build command with final args (replacing content with topic-enriched version)
-  const finalArgs = ["save", title, finalContent];
-  if (opts?.type) finalArgs.push("--type", opts.type);
-  if (opts?.project) finalArgs.push("--project", opts.project);
-  if (opts?.scope) finalArgs.push("--scope", opts.scope);
-
-  try {
-    const output = execSync(`${ENGRAM_EXE} ${finalArgs.map(a => `"${a.replace(/"/g, '\\"')}"`).join(" ")}`, {
-      encoding: "utf-8",
-      timeout: 15000,
-      env: { ...process.env },
-    });
-    return output.trim();
-  } catch (err: any) {
-    const stderr = err.stderr || err.message || "";
-    throw new Error(`engram save failed: ${stderr}`);
+  const res = await fetch(`${ENGRAM_BASE}/observations`, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!res.ok) {
+    const detail = await res.text().catch(() => "");
+    throw new Error(`engram save failed: ${res.status} ${res.statusText} ${detail}`);
   }
+  return res.json() as Promise<{ id: number; status: string }>;
 }
 
 function formatMemoryCard(m: EngramMemory, idx: number): string {
   const date = m.created_at?.slice(0, 19) || "unknown";
   const topic = m.topic_key ? ` [${m.topic_key}]` : "";
-  return `**[${idx}] ${m.title}** (${m.type})${topic}\n${m.content.slice(0, 300)}${m.content.length > 300 ? "..." : ""}\n_${date} | project: ${m.project}_`;
+  const project = m.project || "?";
+  return `**[${idx}] ${m.title}** (${m.type})${topic}\n${m.content.slice(0, 300)}${m.content.length > 300 ? "..." : ""}\n_${date} | project: ${project}_`;
 }
 
 /* --------------- extension --------------- */
@@ -155,15 +186,56 @@ export default function (pi: ExtensionAPI) {
       }),
     }),
     async execute(_toolCallId, params) {
-      const output = engramSave(params.title, params.content, {
+      const saved = await engramSave(params.title, params.content, {
         type: params.type,
         project: params.project,
         scope: params.scope,
         topicKey: params.topic_key,
       });
       return {
-        content: [{ type: "text", text: `Memory saved to engram:\n${output}` }],
-        details: { title: params.title, type: params.type },
+        content: [
+          { type: "text", text: `Memory saved to engram (#${saved.id}):\n${saved.status}` },
+        ],
+        details: { id: saved.id, title: params.title, type: params.type },
+      };
+    },
+  });
+
+  pi.registerTool({
+    name: "mem_edit",
+    label: "Edit Memory",
+    description:
+      "Update an existing engram memory by ID — partial update, only provided fields change. " +
+      "Use to fix a title, append corrections to content, or change type/scope/topic_key of an existing memory. " +
+      "Find the ID via mem_recall or mem_context. Returns the updated memory.",
+    parameters: Type.Object({
+      id: Type.Number({ description: "Memory ID to update (from mem_recall / mem_context results)" }),
+      title: Type.Optional(Type.String({ description: "New title" })),
+      type: Type.Optional(Type.String({
+        description: "New type: decision, bugfix, pattern, architecture, session_summary, convention, exploration",
+      })),
+      content: Type.Optional(Type.String({ description: "New full content" })),
+      topic_key: Type.Optional(Type.String({ description: "New topic key (normalized internally)" })),
+      project: Type.Optional(Type.String({ description: "New project name" })),
+      scope: Type.Optional(Type.String({ description: "New scope: project or user" })),
+    }),
+    async execute(_toolCallId, params) {
+      const updated = await engramUpdate(params.id, {
+        title: params.title,
+        type: params.type,
+        content: params.content,
+        project: params.project,
+        scope: params.scope,
+        topicKey: params.topic_key,
+      });
+      return {
+        content: [
+          {
+            type: "text",
+            text: `Memory #${updated.id} updated:\n${formatMemoryCard(updated, 1)}`,
+          },
+        ],
+        details: { id: updated.id, title: updated.title, type: updated.type },
       };
     },
   });
@@ -175,13 +247,13 @@ export default function (pi: ExtensionAPI) {
       "Search cross-session memories in engram by keyword. Use to recall past architecture decisions, bug fixes, patterns, or conventions before making changes.",
     parameters: Type.Object({
       query: Type.String({ description: "Search query (keywords)" }),
-      type: Type.String({
+      type: Type.Optional(Type.String({
         description: "Filter by memory type: decision, bugfix, pattern, architecture, session_summary",
-      }),
-      limit: Type.Number({
+      })),
+      limit: Type.Optional(Type.Number({
         description: "Max results (default: 5, max: 10)",
         default: 5,
-      }),
+      })),
     }),
     async execute(_toolCallId, params) {
       const limit = Math.min(params.limit || 5, 10);
@@ -260,7 +332,7 @@ export default function (pi: ExtensionAPI) {
     },
   });
 
-  /* ---- startup: inject recent memory context ---- */
+  /* ---- startup: surface engram status (no history injection) ---- */
 
   pi.on("session_start", async (_event, ctx) => {
     try {
@@ -274,37 +346,4 @@ export default function (pi: ExtensionAPI) {
     }
   });
 
-  pi.on("before_agent_start", async (event, ctx) => {
-    // Fetch recent engram context and inject into system prompt.
-    // This gives the LLM awareness of recent sessions, decisions, and patterns
-    // without needing to call mem_context explicitly.
-    let contextBlock = "";
-    try {
-      const ctxText = await engramContext("exocore");
-      // Truncate to ~3000 chars to avoid blowing up the system prompt.
-      // The LLM can call mem_context / mem_recall for more detail.
-      const truncated = ctxText.length > 3500
-        ? ctxText.slice(0, 3500) + "\n\n[... truncated, use mem_context for full context]"
-        : ctxText;
-      contextBlock = `\n\n## Cross-Session Memory (Engram)\n${truncated}\n\n`;
-    } catch {
-      // engram not available — inject minimal hint instead
-      contextBlock =
-        "\n\n## Cross-Session Memory (Engram)\n" +
-        "Engram memory service is not reachable. Tools may still work if it comes back.\n";
-    }
-
-    const hint =
-      "Engram tools available:\n" +
-      "- `mem_context` — fetch recent session context (sessions, prompts, observations)\n" +
-      "- `mem_recall` — search past architecture decisions, bug fixes, patterns (use BEFORE making changes)\n" +
-      "- `mem_save` — persist discoveries, decisions, bug root causes (use AFTER key findings)\n" +
-      "- `mem_stats` — show memory store statistics\n" +
-      "Follow the AGENTS.md engram rules: save architecture decisions, bug root causes, new patterns, or key discoveries.\n" +
-      "Format mem_save content with **What** / **Why** / **Where** / **Learned** sections.";
-
-    return {
-      systemPrompt: event.systemPrompt + contextBlock + hint,
-    };
-  });
 }
