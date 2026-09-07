@@ -1,16 +1,19 @@
 {
-  "lastChangelogVersion": "0.82.1",
+  "lastChangelogVersion": "0.85.1",
   "theme": "light/light",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-sol",
   "defaultThinkingLevel": "medium",
   "showCacheMissNotices": true,
   "enabledModels": [
+    "openai-codex/gpt-5.6-sol",
+    "zai/glm-5.2",
+    "openai-codex/gpt-5.6-luna",
+    "deepseek/deepseek-v4-flash",
+    "opencode-go/deepseek-v4-flash",
     "deepseek/deepseek-v4-pro",
     "opencode-go/deepseek-v4-pro",
-    "opencode-go/deepseek-v4-flash",
-    "zai/glm-5.2",
-    "openai-codex/gpt-5.6-sol",
-    "deepseek/deepseek-v4-flash"
+    "openai-codex/gpt-6-astra",
+    "kimi-coding/k3"
   ]
 }
