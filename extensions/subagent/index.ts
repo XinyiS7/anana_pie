@@ -29,6 +29,7 @@ import {
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { loadSubagentModelPairing, type SubagentModelPairing } from "./model-pairings.ts";
 
 const MAX_PARALLEL_TASKS = 8;
 const MAX_CONCURRENCY = 4;
@@ -53,6 +54,7 @@ function formatUsageStats(
 		turns?: number;
 	},
 	model?: string,
+	thinking?: string,
 ): string {
 	const parts: string[] = [];
 	if (usage.turns) parts.push(`${usage.turns} turn${usage.turns > 1 ? "s" : ""}`);
@@ -65,6 +67,7 @@ function formatUsageStats(
 		parts.push(`ctx:${formatTokens(usage.contextTokens)}`);
 	}
 	if (model) parts.push(model);
+	if (thinking) parts.push(`thinking:${thinking}`);
 	return parts.join(" ");
 }
 
@@ -155,6 +158,7 @@ interface SingleResult {
 	stderr: string;
 	usage: UsageStats;
 	model?: string;
+	thinking?: string;
 	stopReason?: string;
 	errorMessage?: string;
 	step?: number;
@@ -267,6 +271,7 @@ type OnUpdateCallback = (partial: AgentToolResult<SubagentDetails>) => void;
 async function runSingleAgent(
 	defaultCwd: string,
 	agents: AgentConfig[],
+	modelPairing: SubagentModelPairing | null,
 	agentName: string,
 	task: string,
 	cwd: string | undefined,
@@ -291,8 +296,12 @@ async function runSingleAgent(
 		};
 	}
 
+	const effectiveModel = modelPairing?.model ?? agent.model;
+	const effectiveThinking = modelPairing?.thinking;
+
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
-	if (agent.model) args.push("--model", agent.model);
+	if (effectiveModel) args.push("--model", effectiveModel);
+	if (effectiveThinking) args.push("--thinking", effectiveThinking);
 	if (agent.tools && agent.tools.length > 0) args.push("--tools", agent.tools.join(","));
 
 	let tmpPromptDir: string | null = null;
@@ -306,7 +315,8 @@ async function runSingleAgent(
 		messages: [],
 		stderr: "",
 		usage: { input: 0, output: 0, cacheRead: 0, cacheWrite: 0, cost: 0, contextTokens: 0, turns: 0 },
-		model: agent.model,
+		model: effectiveModel,
+		thinking: effectiveThinking,
 		step,
 	};
 
@@ -466,6 +476,7 @@ export default function (pi: ExtensionAPI) {
 			"Modes: single (agent + task), parallel (tasks array), chain (sequential with {previous} placeholder).",
 			`Default agent scope is "user" (from ${path.join(getAgentDir(), "agents")}).`,
 			`To enable project-local agents in ${CONFIG_DIR_NAME}/agents, set agentScope: "both" (or "project").`,
+			"Parent-model pairings from subagent-model-pairings.json override agent model defaults.",
 		].join(" "),
 		parameters: SubagentParams,
 
@@ -474,6 +485,19 @@ export default function (pi: ExtensionAPI) {
 			const discovery = discoverAgents(ctx.cwd, agentScope);
 			const agents = discovery.agents;
 			const confirmProjectAgents = params.confirmProjectAgents ?? true;
+			const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : null;
+			const modelPairing = loadSubagentModelPairing(parentModel);
+
+			if (modelPairing) {
+				const separator = modelPairing.model.indexOf("/");
+				const provider = modelPairing.model.slice(0, separator);
+				const modelId = modelPairing.model.slice(separator + 1);
+				if (!ctx.modelRegistry.find(provider, modelId)) {
+					throw new Error(
+						`Configured subagent model ${modelPairing.model} was not found for parent ${parentModel}`,
+					);
+				}
+			}
 
 			const hasChain = (params.chain?.length ?? 0) > 0;
 			const hasTasks = (params.tasks?.length ?? 0) > 0;
@@ -553,6 +577,7 @@ export default function (pi: ExtensionAPI) {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
+						modelPairing,
 						step.agent,
 						taskWithContext,
 						step.cwd,
@@ -625,6 +650,7 @@ export default function (pi: ExtensionAPI) {
 					const result = await runSingleAgent(
 						ctx.cwd,
 						agents,
+						modelPairing,
 						t.agent,
 						t.task,
 						t.cwd,
@@ -667,6 +693,7 @@ export default function (pi: ExtensionAPI) {
 				const result = await runSingleAgent(
 					ctx.cwd,
 					agents,
+					modelPairing,
 					params.agent,
 					params.task,
 					params.cwd,
@@ -803,7 +830,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 					}
-					const usageStr = formatUsageStats(r.usage, r.model);
+					const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
 					if (usageStr) {
 						container.addChild(new Spacer(1));
 						container.addChild(new Text(theme.fg("dim", usageStr), 0, 0));
@@ -819,7 +846,7 @@ export default function (pi: ExtensionAPI) {
 					text += `\n${renderDisplayItems(displayItems, COLLAPSED_ITEM_COUNT)}`;
 					if (displayItems.length > COLLAPSED_ITEM_COUNT) text += `\n${theme.fg("muted", "(Ctrl+O to expand)")}`;
 				}
-				const usageStr = formatUsageStats(r.usage, r.model);
+				const usageStr = formatUsageStats(r.usage, r.model, r.thinking);
 				if (usageStr) text += `\n${theme.fg("dim", usageStr)}`;
 				return new Text(text, 0, 0);
 			}
@@ -888,7 +915,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
-						const stepUsage = formatUsageStats(r.usage, r.model);
+						const stepUsage = formatUsageStats(r.usage, r.model, r.thinking);
 						if (stepUsage) container.addChild(new Text(theme.fg("dim", stepUsage), 0, 0));
 					}
 
@@ -973,7 +1000,7 @@ export default function (pi: ExtensionAPI) {
 							container.addChild(new Markdown(finalOutput.trim(), 0, 0, mdTheme));
 						}
 
-						const taskUsage = formatUsageStats(r.usage, r.model);
+						const taskUsage = formatUsageStats(r.usage, r.model, r.thinking);
 						if (taskUsage) container.addChild(new Text(theme.fg("dim", taskUsage), 0, 0));
 					}
 

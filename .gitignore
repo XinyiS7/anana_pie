@@ -5,4 +5,6 @@
 !/extensions/
 !/prompts/
 !/settings.json
+!/subagent-model-pairings.json
 !.gitignore
+!/agent-presets/
