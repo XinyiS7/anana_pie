@@ -296,8 +296,18 @@ async function runSingleAgent(
 		};
 	}
 
-	const effectiveModel = modelPairing?.model ?? agent.model;
-	const effectiveThinking = modelPairing?.thinking;
+	// Global subagent default (Alicia 2026-09-15): deepseek flash max.
+	// Applies only when neither a parent-model pairing nor the agent config
+	// pins a model. pi's main-session defaultModel (e.g. gpt-5.6-sol) is
+	// intentionally NOT inherited by subagents.
+	const GLOBAL_SUBAGENT_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+	const GLOBAL_SUBAGENT_DEFAULT_THINKING = "max";
+	const hasExplicitSpec = Boolean(modelPairing || agent.model);
+	const effectiveModel =
+		modelPairing?.model ?? agent.model ?? GLOBAL_SUBAGENT_DEFAULT_MODEL;
+	const effectiveThinking =
+		modelPairing?.thinking ??
+		(hasExplicitSpec ? undefined : GLOBAL_SUBAGENT_DEFAULT_THINKING);
 
 	const args: string[] = ["--mode", "json", "-p", "--no-session"];
 	if (effectiveModel) args.push("--model", effectiveModel);

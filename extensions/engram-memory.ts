@@ -162,7 +162,7 @@ export default function (pi: ExtensionAPI) {
     name: "mem_save",
     label: "Save Memory",
     description:
-      "Save a cross-session memory to engram. Use for architecture decisions, bug root causes, new patterns, or key discoveries that should persist across CLI sessions. Format content with **What** / **Why** / **Where** / **Learned** sections.",
+      "Save a sparse, durable cross-session memory only when it is stable, reusable, costly to rediscover, absent from canonical repository artifacts, and not already covered by an existing memory. Never save routine progress, task/checkpoint/session completion, plans, handoffs, acceptance cycles, test counts, hashes, baselines, or temporary state. If uncertain, do not save; search first when practical and prefer mem_edit for an existing topic. Format content with **What** / **Why** / **Where** / **Learned** sections.",
     parameters: Type.Object({
       title: Type.String({ description: "Short title summarizing the memory" }),
       type: Type.String({
@@ -174,7 +174,7 @@ export default function (pi: ExtensionAPI) {
       }),
       content: Type.String({
         description:
-          "Full memory content. Structure with **What** / **Why** / **Where** / **Learned** sections. Be specific with file paths, commit hashes, and rationale.",
+          "Full durable memory content. Structure with **What** / **Why** / **Where** / **Learned** sections. Include paths or commit hashes only when they are stable identifiers essential to the reusable knowledge; do not copy current checkpoint evidence or progress into memory.",
       }),
       project: Type.String({
         description: "Project name (default: exocore)",

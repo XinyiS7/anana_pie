@@ -1,7 +1,7 @@
 ---
 persona: ecki
 behavior: discuss
-model: opencode-go/deepseek-v4-pro
+model: deepseek/deepseek-v4-flash
 thinking: max
 title: Ecki · discuss
 ---
