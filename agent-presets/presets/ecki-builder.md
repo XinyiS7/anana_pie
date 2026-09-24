@@ -1,7 +1,7 @@
 ---
 persona: ecki
 behavior: builder
-model: deepseek/deepseek-v4-flash
+model: deepseek/deepseek-flash
 thinking: max
 title: Ecki · build
 ---
