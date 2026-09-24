@@ -1,5 +1,5 @@
 {
-  "lastChangelogVersion": "0.85.1",
+  "lastChangelogVersion": "0.87.1",
   "theme": "light/light",
   "defaultProvider": "openai-codex",
   "defaultModel": "gpt-5.6-sol",
@@ -9,7 +9,7 @@
     "openai-codex/gpt-5.6-sol",
     "zai/glm-5.2",
     "openai-codex/gpt-5.6-luna",
-    "deepseek/deepseek-v4-flash",
+    "deepseek/deepseek-flash",
     "opencode-go/deepseek-v4-flash",
     "deepseek/deepseek-v4-pro",
     "opencode-go/deepseek-v4-pro",

@@ -8,3 +8,4 @@
 !/subagent-model-pairings.json
 !.gitignore
 !/agent-presets/
+!/agents/

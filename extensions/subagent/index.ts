@@ -300,7 +300,11 @@ async function runSingleAgent(
 	// Applies only when neither a parent-model pairing nor the agent config
 	// pins a model. pi's main-session defaultModel (e.g. gpt-5.6-sol) is
 	// intentionally NOT inherited by subagents.
-	const GLOBAL_SUBAGENT_DEFAULT_MODEL = "deepseek/deepseek-v4-flash";
+	// Model id must exist in models-store.json: provider "deepseek" exposes
+	// deepseek-flash / deepseek-v4-pro. The older "deepseek-v4-flash" string
+	// matches nothing and breaks every unpinned subagent with
+	// "No models match pattern" + "No API key found for openrouter".
+	const GLOBAL_SUBAGENT_DEFAULT_MODEL = "deepseek/deepseek-flash";
 	const GLOBAL_SUBAGENT_DEFAULT_THINKING = "max";
 	const hasExplicitSpec = Boolean(modelPairing || agent.model);
 	const effectiveModel =
