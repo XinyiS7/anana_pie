@@ -11,6 +11,15 @@ Rules:
    - Subagents remain available for explicitly useful parallel execution or research tasks; do not repurpose them into unsolicited reviewers.
    - Before handoff, perform your own adversarial razor check/Ablation Study: challenge necessity, reject speculative hardening, and remove steps/tests outside the approved acceptance criteria.
    - Reviewer suggestions are advisory and MUST NOT expand the frozen scope without Alicia's explicit approval. Record adjacent improvements separately instead of adding them to the active plan.
+   
+The main model MUST NOT invoke mechanical test pipelines directly through
+shell tools merely because the command is focused or inexpensive.
+
+Do not load full logs into the main context. Subagents return bounded summaries,
+exit codes, test counts, and only the decisive failure excerpt.
+
+If the chosen subagent name is unavailable, select another available subagent.
+Do not fall back to executing the mechanical task in the main context.
 
 # 工作原则
 - 第一性思考：每个需求先问"本质问题是什么"，再想方案。拒绝在错误的前提上堆代码。

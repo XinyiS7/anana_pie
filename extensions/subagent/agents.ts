@@ -11,6 +11,7 @@ export type AgentScope = "user" | "project" | "both";
 export interface AgentConfig {
 	name: string;
 	description: string;
+	aliases: string[];
 	tools?: string[];
 	model?: string;
 	systemPrompt: string;
@@ -21,6 +22,39 @@ export interface AgentConfig {
 export interface AgentDiscoveryResult {
 	agents: AgentConfig[];
 	projectAgentsDir: string | null;
+}
+
+function normalizeName(value: string): string {
+	return value.trim().toLowerCase();
+}
+
+function parseStringList(value: unknown): string[] {
+	const values = typeof value === "string" ? value.split(",") : Array.isArray(value) ? value : [];
+	return values
+		.filter((item): item is string => typeof item === "string")
+		.map((item) => item.trim())
+		.filter(Boolean);
+}
+
+function uniqueNormalized(values: string[], excluded = ""): string[] {
+	const seen = new Set<string>();
+	const out: string[] = [];
+	const excludedName = normalizeName(excluded);
+	for (const value of values) {
+		const normalized = normalizeName(value);
+		if (!normalized || normalized === excludedName || seen.has(normalized)) continue;
+		seen.add(normalized);
+		out.push(normalized);
+	}
+	return out;
+}
+
+function mergeAliases(primary: AgentConfig, inherited?: AgentConfig): AgentConfig {
+	if (!inherited) return primary;
+	return {
+		...primary,
+		aliases: uniqueNormalized([...primary.aliases, ...inherited.aliases], primary.name),
+	};
 }
 
 function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig[] {
@@ -49,22 +83,21 @@ function loadAgentsFromDir(dir: string, source: "user" | "project"): AgentConfig
 			continue;
 		}
 
-		const { frontmatter, body } = parseFrontmatter<Record<string, string>>(content);
+		const { frontmatter, body } = parseFrontmatter<Record<string, unknown>>(content);
+		const name = typeof frontmatter.name === "string" ? frontmatter.name.trim() : "";
+		const description = typeof frontmatter.description === "string" ? frontmatter.description.trim() : "";
+		if (!name || !description) continue;
 
-		if (!frontmatter.name || !frontmatter.description) {
-			continue;
-		}
-
-		const tools = frontmatter.tools
-			?.split(",")
-			.map((t: string) => t.trim())
-			.filter(Boolean);
+		const tools = parseStringList(frontmatter.tools);
+		const aliases = uniqueNormalized(parseStringList(frontmatter.aliases), name);
+		const model = typeof frontmatter.model === "string" ? frontmatter.model.trim() : "";
 
 		agents.push({
-			name: frontmatter.name,
-			description: frontmatter.description,
-			tools: tools && tools.length > 0 ? tools : undefined,
-			model: frontmatter.model,
+			name,
+			description,
+			aliases,
+			tools: tools.length > 0 ? tools : undefined,
+			model: model || undefined,
 			systemPrompt: body,
 			source,
 			filePath,
@@ -104,15 +137,31 @@ export function discoverAgents(cwd: string, scope: AgentScope): AgentDiscoveryRe
 	const agentMap = new Map<string, AgentConfig>();
 
 	if (scope === "both") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of userAgents) agentMap.set(normalizeName(agent.name), agent);
+		for (const agent of projectAgents) {
+			const key = normalizeName(agent.name);
+			agentMap.set(key, mergeAliases(agent, agentMap.get(key)));
+		}
 	} else if (scope === "user") {
-		for (const agent of userAgents) agentMap.set(agent.name, agent);
+		for (const agent of userAgents) agentMap.set(normalizeName(agent.name), agent);
 	} else {
-		for (const agent of projectAgents) agentMap.set(agent.name, agent);
+		for (const agent of projectAgents) agentMap.set(normalizeName(agent.name), agent);
 	}
 
 	return { agents: Array.from(agentMap.values()), projectAgentsDir };
+}
+
+export function findAgentByName(agents: AgentConfig[], requestedName: string): AgentConfig | undefined {
+	const requested = normalizeName(requestedName);
+	if (!requested) return undefined;
+	const canonical = agents.find((agent) => normalizeName(agent.name) === requested);
+	if (canonical) return canonical;
+	const aliasMatches = agents.filter((agent) => agent.aliases.includes(requested));
+	return aliasMatches.length === 1 ? aliasMatches[0] : undefined;
+}
+
+export function formatAgentName(agent: AgentConfig): string {
+	return agent.aliases.length > 0 ? `${agent.name} [aliases: ${agent.aliases.join(", ")}]` : agent.name;
 }
 
 export function formatAgentList(agents: AgentConfig[], maxItems: number): { text: string; remaining: number } {
@@ -120,7 +169,7 @@ export function formatAgentList(agents: AgentConfig[], maxItems: number): { text
 	const listed = agents.slice(0, maxItems);
 	const remaining = agents.length - listed.length;
 	return {
-		text: listed.map((a) => `${a.name} (${a.source}): ${a.description}`).join("; "),
+		text: listed.map((agent) => `${formatAgentName(agent)} (${agent.source}): ${agent.description}`).join("; "),
 		remaining,
 	};
 }

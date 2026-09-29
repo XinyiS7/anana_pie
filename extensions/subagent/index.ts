@@ -28,7 +28,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Container, Markdown, Spacer, Text } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
-import { type AgentConfig, type AgentScope, discoverAgents } from "./agents.ts";
+import { type AgentConfig, type AgentScope, discoverAgents, findAgentByName, formatAgentName } from "./agents.ts";
 import { loadSubagentModelPairing, type SubagentModelPairing } from "./model-pairings.ts";
 
 const MAX_PARALLEL_TASKS = 8;
@@ -280,10 +280,10 @@ async function runSingleAgent(
 	onUpdate: OnUpdateCallback | undefined,
 	makeDetails: (results: SingleResult[]) => SubagentDetails,
 ): Promise<SingleResult> {
-	const agent = agents.find((a) => a.name === agentName);
+	const agent = findAgentByName(agents, agentName);
 
 	if (!agent) {
-		const available = agents.map((a) => `"${a.name}"`).join(", ") || "none";
+		const available = agents.map((a) => `"${formatAgentName(a)}"`).join(", ") || "none";
 		return {
 			agent: agentName,
 			agentSource: "unknown",
@@ -296,15 +296,25 @@ async function runSingleAgent(
 		};
 	}
 
-	// Global subagent default (Alicia 2026-09-15): deepseek flash max.
+	// Global subagent default (Alicia 2026-09-29): commandcode deepseek v4.1 flash max.
 	// Applies only when neither a parent-model pairing nor the agent config
 	// pins a model. pi's main-session defaultModel (e.g. gpt-5.6-sol) is
 	// intentionally NOT inherited by subagents.
-	// Model id must exist in models-store.json: provider "deepseek" exposes
-	// deepseek-flash / deepseek-v4-pro. The older "deepseek-v4-flash" string
-	// matches nothing and breaks every unpinned subagent with
-	// "No models match pattern" + "No API key found for openrouter".
-	const GLOBAL_SUBAGENT_DEFAULT_MODEL = "deepseek/deepseek-flash";
+	// Model id must exist in the catalog: "commandcode/deepseek/deepseek-v4.1-flash"
+	// is provider "commandcode" (from pi-commandcode-provider) with a model id
+	// that itself contains a slash. The first-slash split used for pairing
+	// validation still resolves it correctly, so no special casing is needed.
+	// The older "deepseek-v4-flash" string matches nothing and breaks every
+	// unpinned subagent with "No models match pattern" +
+	// "No API key found for openrouter".
+	//
+	// No automatic cross-model failover exists in pi (retry stays on the same
+	// model, and quota-class errors are deliberately never retried), so a
+	// commandcode subscription cap fails the whole subagent run. "deepseek-flash"
+	// is today's manual fallback: if commandcode starts blocking, flip this
+	// constant back rather than leaving subagents dead. A single-hop fallback
+	// chain is the planned next step (pending a real cap-hit error sample).
+	const GLOBAL_SUBAGENT_DEFAULT_MODEL = "commandcode/deepseek/deepseek-v4.1-flash";
 	const GLOBAL_SUBAGENT_DEFAULT_THINKING = "max";
 	const hasExplicitSpec = Boolean(modelPairing || agent.model);
 	const effectiveModel =
@@ -528,7 +538,7 @@ export default function (pi: ExtensionAPI) {
 				});
 
 			if (modeCount !== 1) {
-				const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+				const available = agents.map((a) => `${formatAgentName(a)} (${a.source})`).join(", ") || "none";
 				return {
 					content: [
 						{
@@ -547,7 +557,7 @@ export default function (pi: ExtensionAPI) {
 				if (params.agent) requestedAgentNames.add(params.agent);
 
 				const projectAgentsRequested = Array.from(requestedAgentNames)
-					.map((name) => agents.find((a) => a.name === name))
+					.map((name) => findAgentByName(agents, name))
 					.filter((a): a is AgentConfig => a?.source === "project");
 
 				if (projectAgentsRequested.length > 0) {
@@ -731,7 +741,7 @@ export default function (pi: ExtensionAPI) {
 				};
 			}
 
-			const available = agents.map((a) => `${a.name} (${a.source})`).join(", ") || "none";
+			const available = agents.map((a) => `${formatAgentName(a)} (${a.source})`).join(", ") || "none";
 			return {
 				content: [{ type: "text", text: `Invalid parameters. Available agents: ${available}` }],
 				details: makeDetails("single")([]),

@@ -7,13 +7,12 @@
   "showCacheMissNotices": true,
   "enabledModels": [
     "openai-codex/gpt-5.6-sol",
-    "zai/glm-5.2",
-    "openai-codex/gpt-5.6-luna",
-    "deepseek/deepseek-flash",
-    "opencode-go/deepseek-v4-flash",
-    "deepseek/deepseek-v4-pro",
-    "opencode-go/deepseek-v4-pro",
     "openai-codex/gpt-6-astra",
-    "kimi-coding/k3"
+    "kimi-coding/k3",
+    "deepseek/deepseek-flash",
+    "commandcode/deepseek/deepseek-v4.1-flash"
+  ],
+  "packages": [
+    "npm:pi-commandcode-provider"
   ]
 }

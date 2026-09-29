@@ -1,5 +1,6 @@
 ---
 name: reviewer
+aliases: code-reviewer, standards-reviewer, spec-reviewer
 description: Code review specialist for quality and security analysis
 tools: read, grep, find, ls, bash
 ---

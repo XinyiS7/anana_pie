@@ -1,5 +1,6 @@
 ---
 name: worker
+aliases: builder, general-purpose, frontend, coder
 description: General-purpose subagent with full capabilities, isolated context
 ---
 
