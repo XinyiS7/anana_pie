@@ -16,6 +16,15 @@ const ABSTRACT_TRIGGER = "__pi_dialogue_abstract_v2__";
 const PROACTIVE_THRESHOLD_TOKENS = 200_000;
 const PROACTIVE_MAX_CONTEXT_WINDOW = 300_000;
 const SEMANTIC_SUMMARY_MAX_TOKENS = 8_192;
+// Semantic compression never runs on the session model. The summarization prompt
+// is a re-serialized text blob with its own system prompt, so it cannot reuse the
+// conversation's prompt cache (measured: ~0.2% cache reads across 106 native
+// compactions) — paying a premium pane model for it buys nothing. Direct-connection
+// deepseek-flash is the cheap default. The session model stays as the fallback
+// because a throw here cancels the entire compaction, including the auto-compaction
+// that fires mid-run on short-window panes.
+const COMPRESSION_MODEL_PROVIDER = "deepseek";
+const COMPRESSION_MODEL_ID = "deepseek-flash";
 
 interface CompactionRequestState {
   generation: number;
@@ -222,44 +231,62 @@ async function compressOlderDialogue(
   signal: AbortSignal,
   ctx: ExtensionContext,
 ): Promise<SemanticCompressionResult> {
-  const model = ctx.model;
-  if (!model) throw new Error("No model is selected for semantic compression");
+  const sessionModel = ctx.model;
+  const preferred = ctx.modelRegistry.find(COMPRESSION_MODEL_PROVIDER, COMPRESSION_MODEL_ID);
+  const primary = preferred ?? sessionModel;
+  if (!primary) throw new Error("No model is available for semantic compression");
 
-  const response = await ctx.modelRegistry.complete(
-    model,
-    {
-      systemPrompt:
-        "You compress earlier dialogue for a coding-session checkpoint. Preserve user intent, " +
-        "decisions, constraints, acceptance verdicts, unresolved questions, exact identifiers, and " +
-        "cross-agent handoffs. Do not continue the conversation. Do not invent file changes or outcomes.",
-      messages: [
-        {
-          role: "user",
-          content: [
-            {
-              type: "text",
-              text:
-                "Semantically compress only the earlier dialogue below. The latest three turns are " +
-                "kept verbatim elsewhere. Return concise Markdown reference context, not a response " +
-                `to the speakers.\n\n<earlier-dialogue>\n${archive.olderDialogue}\n</earlier-dialogue>`,
-            },
-          ],
-          timestamp: Date.now(),
-        },
-      ],
-    },
-    {
-      maxTokens: SEMANTIC_SUMMARY_MAX_TOKENS,
-      signal,
-      cacheRetention: "none",
-      sessionId: uuidv7(),
-    },
-  );
+  const run = async (
+    model: NonNullable<typeof primary>,
+  ): Promise<SemanticCompressionResult> => {
+    const response = await ctx.modelRegistry.complete(
+      model,
+      {
+        systemPrompt:
+          "You compress earlier dialogue for a coding-session checkpoint. Preserve user intent, " +
+          "decisions, constraints, acceptance verdicts, unresolved questions, exact identifiers, and " +
+          "cross-agent handoffs. Do not continue the conversation. Do not invent file changes or outcomes.",
+        messages: [
+          {
+            role: "user",
+            content: [
+              {
+                type: "text",
+                text:
+                  "Semantically compress only the earlier dialogue below. The latest three turns are " +
+                  "kept verbatim elsewhere. Return concise Markdown reference context, not a response " +
+                  `to the speakers.\n\n<earlier-dialogue>\n${archive.olderDialogue}\n</earlier-dialogue>`,
+              },
+            ],
+            timestamp: Date.now(),
+          },
+        ],
+      },
+      {
+        maxTokens: SEMANTIC_SUMMARY_MAX_TOKENS,
+        signal,
+        cacheRetention: "none",
+        sessionId: uuidv7(),
+      },
+    );
 
-  if (response.stopReason === "error" || response.stopReason === "aborted") {
-    throw new Error(response.errorMessage || `Semantic compression stopped: ${response.stopReason}`);
+    if (response.stopReason === "error" || response.stopReason === "aborted") {
+      throw new Error(response.errorMessage || `Semantic compression stopped: ${response.stopReason}`);
+    }
+    const text = contentText(response.content).trim();
+    if (!text) throw new Error("Semantic compression returned empty text");
+    return { text, usage: response.usage };
+  };
+
+  try {
+    return await run(primary);
+  } catch (error) {
+    if (!preferred || !sessionModel || sessionModel === primary || signal.aborted) throw error;
+    const reason = error instanceof Error ? error.message : String(error);
+    ctx.ui.notify(
+      `Semantic compression fell back to ${sessionModel.provider}/${sessionModel.id}: ${reason}`,
+      "warning",
+    );
+    return await run(sessionModel);
   }
-  const text = contentText(response.content).trim();
-  if (!text) throw new Error("Semantic compression returned empty text");
-  return { text, usage: response.usage };
 }
