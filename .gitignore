@@ -9,3 +9,6 @@
 !.gitignore
 !/agent-presets/
 !/agents/
+
+# macOS noise
+.DS_Store
